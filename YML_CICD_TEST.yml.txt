@@ -1,0 +1,1033 @@
+trigger:
+  branches:
+    include:
+    - master
+
+pr: none
+
+variables:
+- name: APP_NAME
+  value: "ai-employee-pricing-calculator"
+- name: APP_SLUG
+  value: "ai-employee-pricing-calculator"
+- name: PUBLIC_PATH
+  value: "/poc/ai-employee-pricing-calculator"
+- name: DEPLOY_ROOT
+  value: "/home/largedealsdemoadmin/data/ai-employee-pricing-calculator"
+- name: BACKEND_PORT
+  value: ""
+- name: BACKEND_HEALTH_PATH
+  value: ""
+- name: CONTAINER_NAME
+  value: ""
+- name: DOCKER_IMAGE
+  value: ""
+- name: SSO_ENABLED
+  value: "false"
+- name: HAS_BACKEND
+  value: "false"
+- name: APP_ENV_CONTENT
+  value: |
+    
+- name: FRONTEND_DIRECTORY
+  value: "."
+- name: FRONTEND_OUTPUT
+  value: "dist"
+- name: BACKEND_DIRECTORY
+  value: ""
+- name: BACKEND_ENTRY_FILE
+  value: ""
+- name: AGENT_POOL
+  value: "CICD Agent"
+- name: AGENT_NAME
+  value: "CICD_TEST"
+- name: NGINX_MAIN_CONFIG
+  value: "/etc/nginx/sites-enabled/default"
+- name: NGINX_BACKUP_DIRECTORY
+  value: "/etc/nginx/pipeline-backups"
+- name: NGINX_GLOBAL_BEGIN
+  value: "# BEGIN PIPELINE MANAGED APPLICATIONS"
+- name: NGINX_GLOBAL_END
+  value: "# END PIPELINE MANAGED APPLICATIONS"
+
+stages:
+- stage: Build
+  displayName: "Build application"
+  jobs:
+  - job: BuildApplication
+    displayName: "Build frontend and package backend"
+    pool:
+      vmImage: "ubuntu-latest"
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+        clean: true
+
+    - task: UseNode@1
+      displayName: "Use Node.js 22"
+      inputs:
+        version: "22.x"
+
+    - task: Bash@3
+      displayName: "Validate project configuration"
+      env:
+        APPLICATION_ENV: $(APP_ENV_CONTENT)
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          echo "Validating project configuration..."
+
+          case "$(SSO_ENABLED)" in
+            true|false) ;;
+            *)
+              echo "ERROR: SSO_ENABLED must be true or false."
+              exit 1
+              ;;
+          esac
+
+          case "$(HAS_BACKEND)" in
+            true|false) ;;
+            *)
+              echo "ERROR: HAS_BACKEND must be true or false."
+              exit 1
+              ;;
+          esac
+
+          if [ "$(HAS_BACKEND)" = "true" ]; then
+            if ! [[ "$(BACKEND_PORT)" =~ ^[0-9]+$ ]]; then
+              echo "ERROR: BACKEND_PORT must be numeric when HAS_BACKEND=true."
+              exit 1
+            fi
+
+            if [ "$(BACKEND_PORT)" -lt 1024 ] ||
+               [ "$(BACKEND_PORT)" -gt 65535 ]; then
+              echo "ERROR: BACKEND_PORT must be between 1024 and 65535."
+              exit 1
+            fi
+          fi
+
+          if [[ "$(PUBLIC_PATH)" != /poc/* ]]; then
+            echo "ERROR: PUBLIC_PATH must begin with /poc/."
+            exit 1
+          fi
+
+          if printf '%s\n' "$APPLICATION_ENV" |
+             grep -q "REPLACE_WITH_"; then
+            echo "ERROR: APP_ENV_CONTENT contains placeholder values."
+            exit 1
+          fi
+
+          if printf '%s\n' "$APPLICATION_ENV" |
+             grep -q '^BACKEND_PORT='; then
+            echo "ERROR: Remove BACKEND_PORT from APP_ENV_CONTENT."
+            echo "The pipeline adds BACKEND_PORT automatically."
+            exit 1
+          fi
+
+          echo "Project configuration is valid."
+
+    - task: Bash@3
+      displayName: "Build frontend"
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          cd "$(FRONTEND_DIRECTORY)"
+
+          echo "Installing frontend dependencies..."
+          npm ci
+
+          echo "Building frontend for $(PUBLIC_PATH)/..."
+          npm run build -- --base="$(PUBLIC_PATH)/"
+
+          echo "Checking frontend output..."
+          test -f "$(FRONTEND_OUTPUT)/index.html"
+
+          echo "Frontend build completed successfully."
+
+    - task: Bash@3
+      displayName: "Validate backend"
+      condition: eq(variables['HAS_BACKEND'], 'true')
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          BACKEND_DIR="$(BACKEND_DIRECTORY)"
+
+          echo "Validating backend files..."
+
+          test -f "$BACKEND_DIR/package.json"
+          test -f "$BACKEND_DIR/package-lock.json"
+          test -f "$BACKEND_DIR/$(BACKEND_ENTRY_FILE)"
+          test -f "$BACKEND_DIR/Dockerfile"
+
+          echo "Backend files are valid."
+
+    - task: Bash@3
+      displayName: "Prepare deployment artifact"
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          ARTIFACT_DIR="$(Build.ArtifactStagingDirectory)/application"
+          FRONTEND_SOURCE="$(FRONTEND_DIRECTORY)/$(FRONTEND_OUTPUT)"
+          BACKEND_SOURCE="$(BACKEND_DIRECTORY)"
+
+          echo "Preparing deployment artifact..."
+
+          rm -rf "$ARTIFACT_DIR"
+
+          mkdir -p "$ARTIFACT_DIR/dist"
+
+          echo "Copying frontend build..."
+
+          cp -a \
+            "$FRONTEND_SOURCE/." \
+            "$ARTIFACT_DIR/dist/"
+
+          if [ "$(HAS_BACKEND)" = "true" ]; then
+            mkdir -p "$ARTIFACT_DIR/backend"
+            echo "Copying backend files..."
+
+            tar \
+              --exclude="node_modules" \
+              --exclude=".env" \
+              --exclude=".env.*" \
+              -C "$BACKEND_SOURCE" \
+              -cf - . |
+            tar \
+              -C "$ARTIFACT_DIR/backend" \
+              -xf -
+          fi
+
+          echo "Validating artifact..."
+
+          test -f "$ARTIFACT_DIR/dist/index.html"
+          if [ "$(HAS_BACKEND)" = "true" ]; then
+            test -f "$ARTIFACT_DIR/backend/package.json"
+            test -f "$ARTIFACT_DIR/backend/package-lock.json"
+            test -f "$ARTIFACT_DIR/backend/$(BACKEND_ENTRY_FILE)"
+            test -f "$ARTIFACT_DIR/backend/Dockerfile"
+          fi
+
+          echo "Deployment artifact is ready."
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish deployment artifact"
+      inputs:
+        targetPath: "$(Build.ArtifactStagingDirectory)/application"
+        artifact: "application"
+        publishLocation: "pipeline"
+
+- stage: Deploy
+  displayName: "Deploy application"
+  dependsOn:
+  - Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeployApplication
+    displayName: "Deploy through CICD_TEST"
+    pool:
+      name: "$(AGENT_POOL)"
+      demands:
+      - Agent.Name -equals $(AGENT_NAME)
+    environment:
+      name: "$(APP_NAME)"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            condition: false
+            inputs:
+              repository: none
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download deployment artifact"
+            inputs:
+              artifact: "application"
+              path: "$(Pipeline.Workspace)/application"
+
+          - task: Bash@3
+            displayName: "Deploy files and create backend environment"
+            env:
+              APPLICATION_ENV: $(APP_ENV_CONTENT)
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+                umask 077
+
+                RELEASE_ID="$(Build.BuildId)-$(date +%Y%m%d%H%M%S)"
+                RELEASES_DIR="$(DEPLOY_ROOT)/releases"
+                RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
+                ARTIFACT_DIR="$(Pipeline.Workspace)/application"
+
+                DIST_NEW="$(DEPLOY_ROOT)/dist.new"
+                BACKEND_NEW="$(DEPLOY_ROOT)/backend.new"
+
+                echo "Application: $(APP_NAME)"
+                echo "Release ID: $RELEASE_ID"
+                echo "Deployment root: $(DEPLOY_ROOT)"
+                echo "Backend port: $(BACKEND_PORT)"
+
+                if [ ! -d "$(DEPLOY_ROOT)" ] || [ ! -w "$(DEPLOY_ROOT)" ] || { [ -d "$RELEASES_DIR" ] && [ ! -w "$RELEASES_DIR" ]; }; then
+                  echo "Ensuring deployment root ownership..."
+                  sudo -n mkdir -p "$(DEPLOY_ROOT)"
+                  sudo -n chown -R "$(id -un):$(id -gn)" "$(DEPLOY_ROOT)"
+                fi
+
+                mkdir -p "$RELEASES_DIR"
+                mkdir -p "$RELEASE_DIR"
+
+                echo "Saving timestamped release..."
+
+                cp -a \
+                  "$ARTIFACT_DIR/." \
+                  "$RELEASE_DIR/"
+
+                test -f "$RELEASE_DIR/dist/index.html"
+
+                echo "Preparing frontend..."
+
+                rm -rf "$DIST_NEW"
+                mkdir -p "$DIST_NEW"
+
+                cp -a \
+                  "$RELEASE_DIR/dist/." \
+                  "$DIST_NEW/"
+
+                test -f "$DIST_NEW/index.html"
+
+                if [ "$(HAS_BACKEND)" = "true" ]; then
+                  echo "Preparing backend..."
+
+                  rm -rf "$BACKEND_NEW"
+                  mkdir -p "$BACKEND_NEW"
+                  cp -a "$RELEASE_DIR/backend/." "$BACKEND_NEW/"
+
+                  test -f "$BACKEND_NEW/$(BACKEND_ENTRY_FILE)"
+                  test -f "$BACKEND_NEW/Dockerfile"
+
+                  echo "Creating backend .env..."
+
+                  {
+                    printf '%s\n' "BACKEND_PORT=$(BACKEND_PORT)"
+                    printf '%s\n' "$APPLICATION_ENV"
+                  } > "$BACKEND_NEW/.env"
+
+                  chmod 600 "$BACKEND_NEW/.env"
+                else
+                  echo "Frontend-only deployment selected. Backend deployment is skipped."
+                  rm -rf "$BACKEND_NEW"
+                fi
+
+                echo "Switching active frontend..."
+
+                rm -rf "$(DEPLOY_ROOT)/dist.previous"
+
+                if [ -d "$(DEPLOY_ROOT)/dist" ]; then
+                  mv \
+                    "$(DEPLOY_ROOT)/dist" \
+                    "$(DEPLOY_ROOT)/dist.previous"
+                fi
+
+                mv \
+                  "$DIST_NEW" \
+                  "$(DEPLOY_ROOT)/dist"
+
+                if [ "$(HAS_BACKEND)" = "true" ]; then
+                  echo "Switching active backend..."
+
+                  rm -rf "$(DEPLOY_ROOT)/backend.previous"
+
+                  if [ -d "$(DEPLOY_ROOT)/backend" ]; then
+                    mv \
+                      "$(DEPLOY_ROOT)/backend" \
+                      "$(DEPLOY_ROOT)/backend.previous"
+                  fi
+
+                  mv \
+                    "$BACKEND_NEW" \
+                    "$(DEPLOY_ROOT)/backend"
+
+                  test -f "$(DEPLOY_ROOT)/dist/index.html"
+                  test -f "$(DEPLOY_ROOT)/backend/.env"
+                  test -f "$(DEPLOY_ROOT)/backend/Dockerfile"
+                fi
+
+                echo "Fixing application permissions..."
+
+                chmod 755 "$(DEPLOY_ROOT)"
+                chmod 755 "$(DEPLOY_ROOT)/dist"
+                chmod -R o+rX "$(DEPLOY_ROOT)/dist"
+
+                if [ "$(HAS_BACKEND)" = "true" ]; then
+                  chmod 755 "$(DEPLOY_ROOT)/backend"
+                  chmod -R o+rX "$(DEPLOY_ROOT)/backend"
+                fi
+
+                echo "Verifying nginx access..."
+
+                sudo -u www-data test -r "$(DEPLOY_ROOT)/dist/index.html"
+
+                echo "Application files deployed successfully."
+
+          - task: Bash@3
+            displayName: "Build and start backend container"
+            condition: eq(variables['HAS_BACKEND'], 'true')
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                BACKEND_DIR="$(DEPLOY_ROOT)/backend"
+                IMAGE_TAG="$(DOCKER_IMAGE):$(Build.BuildId)"
+                HEALTH_URL="http://127.0.0.1:$(BACKEND_PORT)$(BACKEND_HEALTH_PATH)"
+
+                echo "Checking Docker access..."
+                docker version >/dev/null
+
+                echo "Checking port $(BACKEND_PORT)..."
+
+                PORT_LISTENER="$(
+                  ss -lntp 2>/dev/null |
+                  grep ":$(BACKEND_PORT) " || true
+                )"
+
+                EXISTING_CONTAINER="$(
+                  docker ps \
+                    --filter "name=^/$(CONTAINER_NAME)$" \
+                    --format '{{.Names}}' || true
+                )"
+
+                if [ -n "$PORT_LISTENER" ] &&
+                   [ "$EXISTING_CONTAINER" != "$(CONTAINER_NAME)" ]; then
+                  echo "ERROR: Port $(BACKEND_PORT) is occupied."
+                  echo "$PORT_LISTENER"
+                  exit 1
+                fi
+
+                echo "Building Docker image: $IMAGE_TAG"
+
+                docker build \
+                  --tag "$IMAGE_TAG" \
+                  "$BACKEND_DIR"
+
+                echo "Removing previous container..."
+
+                docker rm \
+                  --force \
+                  "$(CONTAINER_NAME)" \
+                  2>/dev/null || true
+
+                echo "Starting backend container..."
+
+                docker run \
+                  --detach \
+                  --restart unless-stopped \
+                  --name "$(CONTAINER_NAME)" \
+                  --env-file "$BACKEND_DIR/.env" \
+                  --publish \
+                    "127.0.0.1:$(BACKEND_PORT):$(BACKEND_PORT)" \
+                  "$IMAGE_TAG"
+
+                echo "Waiting for backend health check..."
+
+                HEALTHY=false
+
+                for ATTEMPT in $(seq 1 30); do
+                  if curl \
+                    --fail \
+                    --silent \
+                    --show-error \
+                    "$HEALTH_URL" >/dev/null; then
+                    HEALTHY=true
+                    break
+                  fi
+
+                  echo "Health attempt $ATTEMPT of 30..."
+                  sleep 2
+                done
+
+                if [ "$HEALTHY" != "true" ]; then
+                  echo "ERROR: Backend health check failed."
+
+                  docker logs \
+                    --tail 100 \
+                    "$(CONTAINER_NAME)" || true
+
+                  exit 1
+                fi
+
+                echo "Backend health check succeeded."
+
+                curl \
+                  --fail \
+                  --silent \
+                  --show-error \
+                  "$HEALTH_URL"
+
+                echo ""
+
+          - task: Bash@3
+            displayName: "Safely update main Nginx configuration"
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                NGINX_FILE="$(NGINX_MAIN_CONFIG)"
+                BACKUP_DIR="$(NGINX_BACKUP_DIRECTORY)"
+
+                TEMP_DIR="$(mktemp -d)"
+                CURRENT_FILE="$TEMP_DIR/nginx-current.conf"
+                CANDIDATE_FILE="$TEMP_DIR/nginx-candidate.conf"
+                BACKUP_VERIFY_FILE="$TEMP_DIR/nginx-backup-verify.conf"
+                RESTORED_VERIFY_FILE="$TEMP_DIR/nginx-restored-verify.conf"
+
+                BACKUP_FILE="$BACKUP_DIR/default.pipeline-backup-$(
+                  date +%Y%m%d-%H%M%S
+                )-build-$(Build.BuildId)"
+
+                cleanup() {
+                  rm -rf "$TEMP_DIR"
+                }
+
+                trap cleanup EXIT
+
+                echo "Waiting for Nginx configuration lock..."
+
+                (
+                  flock -x 200
+
+                  echo "Creating backup directory..."
+
+                  sudo -n mkdir -p "$BACKUP_DIR"
+
+                  echo "Validating current Nginx configuration..."
+
+                  if ! sudo -n nginx -t; then
+                    echo "ERROR: Current Nginx configuration is invalid."
+                    echo "Nginx will not be modified."
+                    exit 1
+                  fi
+
+                  echo "Checking active Nginx file..."
+
+                  if [ ! -r "$NGINX_FILE" ]; then
+                    echo "ERROR: Active Nginx file is not readable."
+                    exit 1
+                  fi
+
+                  ACTIVE_SIZE="$(
+                    wc -c < "$NGINX_FILE"
+                  )"
+
+                  echo "Active Nginx file size: $ACTIVE_SIZE bytes"
+
+                  if [ "$ACTIVE_SIZE" -lt 1000 ]; then
+                    echo "ERROR: Active Nginx file is unexpectedly small."
+                    echo "Nginx will not be modified."
+                    exit 1
+                  fi
+
+                  echo "Creating active-config snapshot..."
+
+                  cp \
+                    "$NGINX_FILE" \
+                    "$CURRENT_FILE"
+
+                  if [ ! -s "$CURRENT_FILE" ]; then
+                    echo "ERROR: Active Nginx snapshot is empty."
+                    exit 1
+                  fi
+
+                  CURRENT_SIZE="$(
+                    wc -c < "$CURRENT_FILE"
+                  )"
+
+                  if [ "$CURRENT_SIZE" -ne "$ACTIVE_SIZE" ]; then
+                    echo "ERROR: Snapshot size differs from active config."
+                    exit 1
+                  fi
+
+                  echo "Creating Nginx backup..."
+
+                  sudo -n cp \
+                    --preserve=all \
+                    "$NGINX_FILE" \
+                    "$BACKUP_FILE"
+
+                  echo "Creating readable backup-verification copy..."
+
+                  cp \
+                    "$BACKUP_FILE" \
+                    "$BACKUP_VERIFY_FILE"
+
+                  if [ ! -s "$BACKUP_VERIFY_FILE" ]; then
+                    echo "ERROR: Nginx backup is empty."
+                    exit 1
+                  fi
+
+                  if ! cmp \
+                    --silent \
+                    "$CURRENT_FILE" \
+                    "$BACKUP_VERIFY_FILE"; then
+                    echo "ERROR: Backup differs from active snapshot."
+                    exit 1
+                  fi
+
+                  echo "Nginx backup verified successfully:"
+                  echo "$BACKUP_FILE"
+
+                  echo "Generating candidate configuration..."
+
+                  python3 - \
+                    "$CURRENT_FILE" \
+                    "$CANDIDATE_FILE" \
+                    "$(NGINX_GLOBAL_BEGIN)" \
+                    "$(NGINX_GLOBAL_END)" \
+                    "$(APP_SLUG)" \
+                    "$(PUBLIC_PATH)" \
+                    "$(BACKEND_PORT)" \
+                    "$(DEPLOY_ROOT)" \
+                    "$(SSO_ENABLED)" \
+                    "$(HAS_BACKEND)" <<'PYTHON'
+                import pathlib
+                import re
+                import sys
+                import textwrap
+
+                source_file = pathlib.Path(sys.argv)
+                candidate_file = pathlib.Path(sys.argv[2])
+
+                global_begin = sys.argv[3]
+                global_end = sys.argv[4]
+                app_slug = sys.argv[5]
+                public_path = sys.argv[6].rstrip("/")
+                backend_port = sys.argv[7]
+                deploy_root = sys.argv[8].rstrip("/")
+                sso_enabled = sys.argv[9].lower()
+                has_backend = sys.argv[10].lower()
+
+                if sso_enabled not in {"true", "false"}:
+                    raise SystemExit(
+                        "SSO_ENABLED must be true or false"
+                    )
+
+                if has_backend not in {"true", "false"}:
+                    raise SystemExit(
+                        "HAS_BACKEND must be true or false"
+                    )
+
+                content = source_file.read_text(
+                    encoding="utf-8"
+                )
+
+                if not content.strip():
+                    raise SystemExit(
+                        "Source Nginx configuration is empty"
+                    )
+
+                if content.count(global_begin) != 1:
+                    raise SystemExit(
+                        "Expected exactly one global begin marker"
+                    )
+
+                if content.count(global_end) != 1:
+                    raise SystemExit(
+                        "Expected exactly one global end marker"
+                    )
+
+                begin_position = content.index(global_begin)
+                end_position = content.index(global_end)
+
+                if begin_position >= end_position:
+                    raise SystemExit(
+                        "Global markers are in the wrong order"
+                    )
+
+                before = content[
+                    :begin_position + len(global_begin)
+                ]
+
+                managed = content[
+                    begin_position + len(global_begin):
+                    end_position
+                ]
+
+                after = content[end_position:]
+
+                app_begin = (
+                    f"# BEGIN MANAGED APP: {app_slug}"
+                )
+
+                app_end = (
+                    f"# END MANAGED APP: {app_slug}"
+                )
+
+                app_pattern = re.compile(
+                    rf"\n*{re.escape(app_begin)}.*?"
+                    rf"{re.escape(app_end)}\n*",
+                    re.DOTALL,
+                )
+
+                managed_without_current = app_pattern.sub(
+                    "\n",
+                    managed,
+                ).strip()
+
+                duplicate_check = (
+                    before
+                    + managed_without_current
+                    + after
+                )
+
+                if public_path in duplicate_check:
+                    raise SystemExit(
+                        "Public path already exists outside "
+                        f"the managed application block: {public_path}"
+                    )
+
+                if has_backend == "true":
+                    proxy_pattern = re.compile(
+                        rf"proxy_pass\s+http://127\.0\.0\.1:"
+                        rf"{re.escape(backend_port)}(?:/|;)"
+                    )
+
+                    if proxy_pattern.search(duplicate_check):
+                        raise SystemExit(
+                            "Backend port already exists in Nginx: "
+                            f"{backend_port}"
+                        )
+
+                frontend_parts = []
+
+                if sso_enabled == "true":
+                    sso_block = textwrap.dedent(
+                        f"""
+                        if ($http_cookie !~ "holmes_login_generic") {{
+                            return 302 https://wingsdemo.waip.wiprocms.com/Login/Default.aspx?ReturnURL=https://experiencecenter.waip.wiprocms.com{public_path}/;
+                        }}
+                        """
+                    ).strip()
+
+                    frontend_parts.append(
+                        textwrap.indent(
+                            sso_block,
+                            "    ",
+                        )
+                    )
+
+                frontend_block = textwrap.dedent(
+                    f"""
+                    alias {deploy_root}/dist/;
+                    index index.html;
+
+                    try_files $uri $uri/ {public_path}/index.html;
+                    """
+                ).strip()
+
+                frontend_parts.append(
+                    textwrap.indent(
+                        frontend_block,
+                        "    ",
+                    )
+                )
+
+                frontend_content = "\n\n".join(
+                    frontend_parts
+                )
+
+                api_block = ""
+                if has_backend == "true":
+                    api_block = textwrap.dedent(
+                        f"""
+                        location ^~ {public_path}/api/ {{
+                            proxy_pass http://127.0.0.1:{backend_port}/api/;
+                            proxy_http_version 1.1;
+                            proxy_set_header Host $host;
+                            proxy_set_header X-Real-IP $remote_addr;
+                            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                            proxy_set_header X-Forwarded-Proto $scheme;
+                            proxy_set_header Cookie $http_cookie;
+                            proxy_connect_timeout 30s;
+                            proxy_send_timeout 120s;
+                            proxy_read_timeout 120s;
+                        }}
+                        """
+                    ).strip()
+
+                app_sections = [app_begin]
+                if api_block:
+                    app_sections.append(api_block)
+                app_sections.extend([
+                    textwrap.dedent(
+                        f"""
+                        location = {public_path} {{
+                            return 301 {public_path}/;
+                        }}
+                        location ^~ {public_path}/ {{
+                        {frontend_content}
+                        }}
+                        """
+                    ).strip(),
+                    app_end,
+                ])
+                app_block = "\n\n".join(app_sections)
+
+                if managed_without_current:
+                    new_managed = (
+                        f"\n\n{managed_without_current}"
+                        f"\n\n{app_block}\n\n"
+                    )
+                else:
+                    new_managed = (
+                        f"\n\n{app_block}\n\n"
+                    )
+
+                candidate_content = (
+                    before
+                    + new_managed
+                    + after
+                )
+
+                candidate_file.write_text(
+                    candidate_content,
+                    encoding="utf-8",
+                )
+                PYTHON
+
+                  echo "Checking generated candidate..."
+
+                  if [ ! -s "$CANDIDATE_FILE" ]; then
+                    echo "ERROR: Candidate Nginx configuration is empty."
+                    echo "Active Nginx will not be modified."
+                    exit 1
+                  fi
+
+                  CANDIDATE_SIZE="$(
+                    wc -c < "$CANDIDATE_FILE"
+                  )"
+
+                  echo "Candidate size: $CANDIDATE_SIZE bytes"
+
+                  if [ "$CANDIDATE_SIZE" -lt 1000 ]; then
+                    echo "ERROR: Candidate configuration is too small."
+                    exit 1
+                  fi
+
+                  if [ "$CANDIDATE_SIZE" -lt "$ACTIVE_SIZE" ]; then
+                    echo "ERROR: Candidate is smaller than active config."
+                    echo "This could indicate accidental truncation."
+                    exit 1
+                  fi
+
+                  grep \
+                    --fixed-strings \
+                    "# BEGIN MANAGED APP: $(APP_SLUG)" \
+                    "$CANDIDATE_FILE"
+
+                  grep \
+                    --fixed-strings \
+                    "# END MANAGED APP: $(APP_SLUG)" \
+                    "$CANDIDATE_FILE"
+
+                  grep \
+                    --fixed-strings \
+                    "alias $(DEPLOY_ROOT)/dist/;" \
+                    "$CANDIDATE_FILE"
+
+                  if [ "$(HAS_BACKEND)" = "true" ]; then
+                    grep \
+                      --fixed-strings \
+                      "proxy_pass http://127.0.0.1:$(BACKEND_PORT)/api/;" \
+                      "$CANDIDATE_FILE"
+                  fi
+
+                  if [ "$(SSO_ENABLED)" = "true" ]; then
+                    grep \
+                      --fixed-strings \
+                      "holmes_login_generic" \
+                      "$CANDIDATE_FILE"
+                  fi
+
+                  echo "Installing candidate Nginx configuration..."
+
+                  sudo -n install \
+                    -o root \
+                    -g root \
+                    -m 644 \
+                    "$CANDIDATE_FILE" \
+                    "$NGINX_FILE"
+
+                  echo "Validating installed Nginx configuration..."
+
+                  if sudo -n nginx -t; then
+                    echo "Nginx validation succeeded."
+
+                    echo "Reloading Nginx gracefully..."
+
+                    sudo -n systemctl reload nginx
+
+                    echo "Nginx reloaded successfully."
+                  else
+                    echo "ERROR: Candidate Nginx config is invalid."
+                    echo "Restoring verified backup:"
+                    echo "$BACKUP_FILE"
+
+                    sudo -n install \
+                      -o root \
+                      -g root \
+                      -m 644 \
+                      "$BACKUP_FILE" \
+                      "$NGINX_FILE"
+
+                    cp \
+                      "$NGINX_FILE" \
+                      "$RESTORED_VERIFY_FILE"
+
+                    if [ ! -s "$RESTORED_VERIFY_FILE" ]; then
+                      echo "CRITICAL: Restored config is empty."
+                      echo "Nginx was not reloaded."
+                      exit 1
+                    fi
+
+                    if ! cmp \
+                      --silent \
+                      "$RESTORED_VERIFY_FILE" \
+                      "$BACKUP_VERIFY_FILE"; then
+                      echo "CRITICAL: Restored config differs from backup."
+                      echo "Nginx was not reloaded."
+                      exit 1
+                    fi
+
+                    if ! sudo -n nginx -t; then
+                      echo "CRITICAL: Restored Nginx config is invalid."
+                      echo "Nginx was not reloaded."
+                      exit 1
+                    fi
+
+                    echo "Previous Nginx configuration restored."
+                    echo "Nginx was not reloaded."
+
+                    exit 1
+                  fi
+
+                ) 200>/tmp/nginx-main-config.lock
+
+          - task: Bash@3
+            displayName: "Verify deployment"
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                if [ "$(HAS_BACKEND)" = "true" ]; then
+                  HEALTH_URL="http://127.0.0.1:$(BACKEND_PORT)$(BACKEND_HEALTH_PATH)"
+                  echo "Checking backend health..."
+
+                  curl \
+                    --fail \
+                    --silent \
+                    --show-error \
+                    "$HEALTH_URL"
+                fi
+
+                echo ""
+                echo "Checking frontend file..."
+
+                test -f "$(DEPLOY_ROOT)/dist/index.html"
+
+                echo "Frontend index exists."
+
+                echo ""
+                echo "Checking Nginx main config size..."
+
+                FINAL_NGINX_SIZE="$(
+                  wc -c < "$(NGINX_MAIN_CONFIG)"
+                )"
+
+                if [ "$FINAL_NGINX_SIZE" -lt 1000 ]; then
+                  echo "ERROR: Final Nginx config is unexpectedly small."
+                  exit 1
+                fi
+
+                echo "Final Nginx size: $FINAL_NGINX_SIZE bytes"
+
+                echo ""
+                echo "Checking Nginx configuration..."
+
+                sudo -n nginx -t
+
+                echo ""
+                echo "Checking Nginx service..."
+
+                NGINX_STATUS="$(
+                  systemctl is-active nginx
+                )"
+
+                if [ "$NGINX_STATUS" != "active" ]; then
+                  echo "ERROR: Nginx is not active."
+                  exit 1
+                fi
+
+                echo "Nginx status: $NGINX_STATUS"
+
+                echo ""
+                echo "Deployment completed successfully."
+
+                echo ""
+                echo "Frontend URL:"
+                echo "https://experiencecenter.waip.wiprocms.com$(PUBLIC_PATH)/"
+
+                if [ "$(HAS_BACKEND)" = "true" ]; then
+                  echo ""
+                  echo "API health URL:"
+                  echo "https://experiencecenter.waip.wiprocms.com$(PUBLIC_PATH)$(BACKEND_HEALTH_PATH)"
+                fi
+
+          - task: Bash@3
+            displayName: "Keep latest five releases"
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                RELEASES_DIR="$(DEPLOY_ROOT)/releases"
+
+                echo "Keeping latest five releases..."
+
+                if [ -d "$RELEASES_DIR" ]; then
+                  mapfile -t OLD_RELEASES < <(
+                    find "$RELEASES_DIR" \
+                      -mindepth 1 \
+                      -maxdepth 1 \
+                      -type d \
+                      -printf '%T@ %p\n' |
+                    sort -rn |
+                    tail -n +6 |
+                    cut -d' ' -f2-
+                  )
+
+                  for RELEASE in "${OLD_RELEASES[@]}"; do
+                    echo "Removing old release: $RELEASE"
+                    rm -rf "$RELEASE"
+                  done
+                fi
+
+                echo "Available releases:"
+
+                find "$RELEASES_DIR" \
+                  -mindepth 1 \
+                  -maxdepth 1 \
+                  -type d \
+                  -printf '%f\n' |
+                sort -r || true
